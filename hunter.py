@@ -293,11 +293,13 @@ class Hunter:
         self.proc.write_line(value)
 
     # ---- session entry point ----
-    def play_session(self, *, target_wins: int, max_games: int) -> None:
+    def play_session(self, *, target_wins: int | None, max_games: int) -> None:
         self.proc.start()
         try:
             blk = self._drain_to_opening()
-            while self.stats.wins < target_wins and self.stats.games < max_games:
+            while self.stats.games < max_games and (
+                target_wins is None or self.stats.wins < target_wins
+            ):
                 next_blk = self._step(blk)
                 if next_blk is None:
                     break
@@ -520,7 +522,7 @@ class CliArgs:
     binary: str
     seed: int | None
     games: int
-    target_wins: int
+    target_wins: int | None
     quiet: bool
     strict: bool
 
@@ -544,8 +546,8 @@ def _parse_cli(argv: list[str] | None) -> CliArgs:
     _ = p.add_argument(
         "--target-wins",
         type=int,
-        default=1,
-        help="Stop after this many wins (default: 1)",
+        default=None,
+        help="Stop early once this many wins are reached (default: play all --games)",
     )
     _ = p.add_argument(
         "-q",
@@ -565,7 +567,7 @@ def _parse_cli(argv: list[str] | None) -> CliArgs:
         binary=cast(str, ns.binary),
         seed=cast(int | None, ns.seed),
         games=cast(int, ns.games),
-        target_wins=cast(int, ns.target_wins),
+        target_wins=cast(int | None, ns.target_wins),
         quiet=cast(bool, ns.quiet),
         strict=cast(bool, ns.strict),
     )
@@ -605,7 +607,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     hunter.play_session(target_wins=args.target_wins, max_games=args.games)
     print_summary(hunter.stats)
-    return 0 if hunter.stats.wins >= args.target_wins else 1
+    required_wins = args.target_wins if args.target_wins is not None else 1
+    return 0 if hunter.stats.wins >= required_wins else 1
 
 
 if __name__ == "__main__":
