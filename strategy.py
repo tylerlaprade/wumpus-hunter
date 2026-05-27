@@ -129,9 +129,13 @@ def death_prob_on_move(belief: Belief, target: int) -> float:
     """Expected probability of losing the game by moving to `target` *now*.
 
     One-step lookahead. Hazards are placed in distinct rooms initially,
-    but the wumpus can migrate into a bat or pit room after a wake — so
-    wumpus and bat risks are accumulated, not exclusive. Pit risk caps
-    at 1.0 (certain death).
+    but the wumpus can migrate into a bat or pit room after a wake (the
+    1972 BASIC wumpus-move routine at lines 3370-3440 doesn't filter).
+    The post-move hazard check at lines 4140-4310 fires wumpus first:
+    he stays (P=0.25, we die), or moves (P=0.75, then pit/bat checks
+    run). So in a wumpus+bat room the conditional is
+    `0.25 + 0.75 * 0.125 = 0.34375`; pit always kills regardless of
+    what the wumpus does.
     """
     if not belief:
         return 1.0
@@ -140,12 +144,14 @@ def death_prob_on_move(belief: Belief, target: int) -> float:
         if target in w.pits:
             total += PIT_RISK
             continue
-        risk = 0.0
-        if target == w.wumpus:
-            risk += WUMPUS_RISK
-        if target in w.bats:
-            risk += BAT_RISK
-        total += risk
+        has_wumpus = target == w.wumpus
+        has_bat = target in w.bats
+        if has_wumpus and has_bat:
+            total += WUMPUS_RISK + (1.0 - WUMPUS_RISK) * BAT_RISK
+        elif has_wumpus:
+            total += WUMPUS_RISK
+        elif has_bat:
+            total += BAT_RISK
     return total / len(belief)
 
 
