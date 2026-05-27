@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
-"""hunter.py - fair fresh-game autoplayer for /tmp/wumpus.
+"""hunter.py - I/O, game lifecycle, CLI.
 
-Companion to Codex's `wumpus_hunter.py`. That file holds the precise
-world-enumeration belief model and a strict-fair player. This file
-adds the pieces strict-mode doesn't cover for one-life/no-cheating play:
+Spawns the `/tmp/wumpus` binary on a pseudo-tty, runs one fair life
+end-to-end using `strategy.choose_action`, applying the dynamic belief
+updates from `strategy` for snatches and missed shots. Optionally repeats
+across many independent games for benchmarking.
 
-  - Risk-minimizing fallback when no guaranteed-safe move exists, using
-    expected-death probability computed over the live world set.
-  - Belief updates for events strict-mode skips:
-      * wumpus migration after a missed shot
-      * bat snatch (target room confirmed-bat, player teleported)
-      * entering the wumpus's room and surviving (he moved away)
-  - Full game lifecycle: handle every prompt, answer SAME SETUP=N after
-    death to discard the failed hidden map, and keep trying fresh games
-    until we win.
-  - Stats across games (wins, loss reasons, moves, shots).
-
-Usage:
-    python3 hunter.py [--target-wins K] [--max-games N] [--seed S] [-v]
+A "fair fresh-game" run uses no information across games — the belief
+state is rebuilt from each new opening observation. After a loss we
+answer `SAME SETUP (Y-N) ? N` so the binary discards the hidden map and
+starts over with a freshly randomized layout.
 """
 
 from __future__ import annotations
@@ -25,44 +17,49 @@ from __future__ import annotations
 import argparse
 import os
 import pty
+import re
 import select
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Final, Literal, cast, get_args
 
-import wumpus_hunter as wh
-from wumpus_hunter import (
-    GRAPH,
-    Move,
+from belief import (
+    ARROW_SELF_TEXT,
+    Action,
+    BAT_SNATCH_TEXT,
+    Belief,
+    MISSED_TEXT,
+    OUT_OF_ARROWS_TEXT,
+    LOSE_BANNER_TEXT,
     Observation,
+    PIT_DEATH_TEXT,
+    PIT_SHRIEK_TEXT,
     Shot,
-    World,
-    action_to_inputs,
-    enumerate_shots,
-    filter_worlds,
-    guaranteed_safe_moves,
-    guaranteed_winning_shots,
-    initial_worlds,
-    matches_observation,
-    observation_for,
+    WIN_TEXT,
+    WUMPUS_DEATH_TEXT,
+    current_player,
+    filter_belief,
+    fmt_shot_path,
+    initial_belief,
+    parse_observation,
+)
+from strategy import (
+    best_desperation_action,
+    choose_action,
+    update_on_miss,
+    update_on_move,
+    update_on_snatch,
 )
 
 
-# ---------------------------------------------------------------------------
-# Game messages. WIN/LOSE strings come from Codex's file; SUPER BAT and the
-# prompts I confirmed from the binary or the user's transcript.
-# ---------------------------------------------------------------------------
-WIN_TEXT = "AHA! YOU GOT THE WUMPUS"
-WUMPUS_DEATH = "TSK TSK TSK"          # wumpus ate us
-PIT_DEATH = "FELL IN PIT"             # also "YYYYIIIIEEEE"
-ARROW_SELF = "OUCH! ARROW GOT YOU"    # we shot ourselves
-OUT_OF_ARROWS = "OUT OF ARROWS"
-LOSE_BANNER = "HA HA HA - YOU LOSE"
-BAT_SNATCH = "BAT SNATCH"             # appears inside "ZAP--SUPER BAT SNATCH!"
-MISSED = "MISSED"
+DEFAULT_BINARY: Final[str] = "/tmp/wumpus"
+DEFAULT_TIMEOUT_S: Final[float] = 5.0
+QUIET_WINDOW_S: Final[float] = 0.08
+SETUP_PROMPT_DEADLINE_S: Final[float] = 3.0
+StateKey = tuple[int, int, Belief]
 
-PROMPT_TOKENS = (
+PromptKind = Literal[
     "INSTRUCTIONS (Y-N)",
     "SHOOT OR MOVE (S-M)",
     "WHERE TO",
@@ -70,24 +67,30 @@ PROMPT_TOKENS = (
     "ROOM #",
     "SAME SETUP (Y-N)",
     "TYPE AN E THEN RETURN",
+]
+PROMPT_KINDS: Final[tuple[PromptKind, ...]] = get_args(PromptKind)
+_PROMPT_RE: Final[re.Pattern[str]] = re.compile(
+    "|".join(re.escape(p) for p in PROMPT_KINDS)
 )
 
 
 # ---------------------------------------------------------------------------
-# Driver: spawn the binary on a pty so the prompt char "?" flushes promptly.
+# GameProcess: spawn binary on pty, read until prompt, send line.
 # ---------------------------------------------------------------------------
 class GameProcess:
     def __init__(self, argv: list[str]) -> None:
-        self.argv = argv
+        self.argv: list[str] = argv
         self.pid: int | None = None
         self.fd: int | None = None
 
     def start(self) -> None:
         pid, fd = pty.fork()
         if pid == 0:
+            # Any failure in the child must terminate it; otherwise the child
+            # falls through to parent code and races on the pty.
             try:
                 os.execv(self.argv[0], self.argv)
-            except Exception:
+            except BaseException:
                 os._exit(127)
         self.pid = pid
         self.fd = fd
@@ -100,7 +103,7 @@ class GameProcess:
         except ProcessLookupError:
             pass
         try:
-            os.waitpid(self.pid, 0)
+            _ = os.waitpid(self.pid, 0)
         except ChildProcessError:
             pass
         if self.fd is not None:
@@ -111,9 +114,13 @@ class GameProcess:
         self.pid = None
         self.fd = None
 
-    def read_until_prompt(self, overall_timeout: float = 5.0, quiet_window: float = 0.08) -> str:
-        """Read until output ends in `?` and stays quiet briefly, or proc exits."""
-        assert self.fd is not None
+    def read_until_prompt(
+        self,
+        overall_timeout: float = DEFAULT_TIMEOUT_S,
+        quiet_window: float = QUIET_WINDOW_S,
+    ) -> str:
+        if self.fd is None:
+            raise RuntimeError("read_until_prompt called on stopped process")
         deadline = time.monotonic() + overall_timeout
         out = b""
         last_byte_t = time.monotonic()
@@ -121,8 +128,8 @@ class GameProcess:
             now = time.monotonic()
             if now > deadline:
                 break
-            timeout = min(quiet_window, max(0.0, deadline - now))
-            r, _, _ = select.select([self.fd], [], [], timeout)
+            wait = min(quiet_window, max(0.0, deadline - now))
+            r, _, _ = select.select([self.fd], [], [], wait)
             if r:
                 try:
                     chunk = os.read(self.fd, 4096)
@@ -141,26 +148,27 @@ class GameProcess:
         return out.decode("utf-8", errors="replace")
 
     def write_line(self, value: str) -> None:
-        assert self.fd is not None
-        os.write(self.fd, (value + "\n").encode("ascii"))
+        if self.fd is None:
+            raise RuntimeError("write_line called on stopped process")
+        _ = os.write(self.fd, (value + "\n").encode("ascii"))
 
 
 # ---------------------------------------------------------------------------
-# Block-level parser: detect prompts, warnings, terminal events.
+# Block parser: detect prompts, warnings, terminal events.
 # ---------------------------------------------------------------------------
-@dataclass
+@dataclass(slots=True)
 class Block:
     raw: str
-    upper: str = ""
-    obs: Observation | None = None
-    prompt: str | None = None
-    bat_snatch: bool = False
-    miss: bool = False
-    death_pit: bool = False
-    death_wumpus: bool = False
-    death_arrow: bool = False
-    out_of_arrows: bool = False
-    victory: bool = False
+    obs: Observation | None
+    prompt: PromptKind | None
+    bat_snatch: bool
+    miss: bool
+    death_pit: bool
+    death_wumpus: bool
+    death_arrow: bool
+    out_of_arrows: bool
+    lose_banner: bool
+    victory: bool
 
     @property
     def terminal(self) -> bool:
@@ -170,318 +178,163 @@ class Block:
             or self.death_wumpus
             or self.death_arrow
             or self.out_of_arrows
+            or self.lose_banner
         )
+
+
+def _last_prompt(upper_text: str) -> PromptKind | None:
+    last: PromptKind | None = None
+    for match in _PROMPT_RE.finditer(upper_text):
+        # cast: every alternation in _PROMPT_RE is a PromptKind literal.
+        last = cast(PromptKind, match.group(0))
+    return last
 
 
 def parse_block(text: str) -> Block:
-    blk = Block(raw=text, upper=text.upper())
-    u = blk.upper
-
-    blk.obs = Observation.parse_latest(text)
-    if BAT_SNATCH in u:
-        blk.bat_snatch = True
-    if MISSED in u:
-        blk.miss = True
-    if WIN_TEXT in u:
-        blk.victory = True
-    if WUMPUS_DEATH in u:
-        blk.death_wumpus = True
-    if PIT_DEATH in u or "YYYYIIIIEEEE" in u:
-        blk.death_pit = True
-    if ARROW_SELF in u:
-        blk.death_arrow = True
-    if OUT_OF_ARROWS in u:
-        blk.out_of_arrows = True
-
-    last_prompt = None
-    last_pos = -1
-    for tok in PROMPT_TOKENS:
-        pos = u.rfind(tok)
-        if pos > last_pos:
-            last_pos = pos
-            last_prompt = tok
-    blk.prompt = last_prompt
-    return blk
+    u = text.upper()
+    return Block(
+        raw=text,
+        obs=parse_observation(text),
+        prompt=_last_prompt(u),
+        bat_snatch=BAT_SNATCH_TEXT in u,
+        miss=MISSED_TEXT in u,
+        death_pit=PIT_DEATH_TEXT in u or PIT_SHRIEK_TEXT in u,
+        death_wumpus=WUMPUS_DEATH_TEXT in u,
+        death_arrow=ARROW_SELF_TEXT in u,
+        out_of_arrows=OUT_OF_ARROWS_TEXT in u,
+        lose_banner=LOSE_BANNER_TEXT in u,
+        victory=WIN_TEXT in u,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Belief updates beyond strict mode.
+# Outcome + stats.
 # ---------------------------------------------------------------------------
-def update_on_move(
-    worlds: set[World],
-    target: int,
-    post: Observation,
-) -> set[World]:
-    """Player moved to `target` (no death, no snatch). Update world set."""
-    out: set[World] = set()
-    for w in worlds:
-        if target in w.pits:
-            continue  # would've died; not consistent with being alive
-        if target in w.bats:
-            continue  # would've been snatched (different code path)
-        if target == w.wumpus:
-            # Wumpus woke. He stayed (P=0.25 → we'd die) or moved (P=0.75
-            # → survived). Since we survived, branch over neighbors.
-            for new_w in GRAPH[w.wumpus]:
-                nw = World(target, new_w, w.pits, w.bats)
-                if matches_observation(nw, post):
-                    out.add(nw)
-        else:
-            nw = World(target, w.wumpus, w.pits, w.bats)
-            if matches_observation(nw, post):
-                out.add(nw)
-    return out
+Outcome = Literal["win", "loss-pit", "loss-wumpus", "loss-arrow", "loss-out-of-arrows", "loss-unknown"]
 
 
-def update_on_snatch(
-    worlds: set[World],
-    snatch_target: int,
-    post: Observation,
-) -> set[World]:
-    """Player moved to `snatch_target` (a bat room), then teleported."""
-    out: set[World] = set()
-    new_player = post.room
-    for w in worlds:
-        if snatch_target not in w.bats:
-            continue
-        if new_player in w.pits:
-            continue  # would've died
-        if new_player == w.wumpus:
-            # Teleport into wumpus room wakes him; he moved away (we survived).
-            for new_w in GRAPH[w.wumpus]:
-                nw = World(new_player, new_w, w.pits, w.bats)
-                if matches_observation(nw, post):
-                    out.add(nw)
-        else:
-            nw = World(new_player, w.wumpus, w.pits, w.bats)
-            if matches_observation(nw, post):
-                out.add(nw)
-    return out
+@dataclass(slots=True)
+class GameLog:
+    outcome: Outcome
+    moves: int
+    shots: int
+    trail: list[str]
 
 
-def update_on_miss(
-    worlds: set[World],
-    shot_path: tuple[int, ...],
-    post: Observation,
-) -> set[World]:
-    """Shot at `shot_path` missed. Wumpus may have moved one step."""
-    out: set[World] = set()
-    player_room = post.room
-    for w in worlds:
-        if w.wumpus in shot_path:
-            continue  # path would've killed him; inconsistent with miss
-        for new_w in (w.wumpus, *GRAPH[w.wumpus]):
-            if new_w == player_room:
-                continue  # he'd have eaten us
-            nw = World(w.player, new_w, w.pits, w.bats)
-            if matches_observation(nw, post):
-                out.add(nw)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Risk-minimizing fallback policy.
-# ---------------------------------------------------------------------------
-PIT_PENALTY = 1.0        # certain death
-WUMPUS_STAY = 0.25       # P(wumpus stays when we walk in)
-BAT_CHAIN_DEATH = 1 / 8  # p = 2/20 + (1/20 * 1/4) + (2/20 * p)
-
-
-def death_prob_on_move(worlds: set[World], target: int) -> float:
-    """One-step expected loss probability for moving to `target`."""
-    if not worlds:
-        return 1.0
-    risk = 0.0
-    for w in worlds:
-        if target in w.pits:
-            risk += PIT_PENALTY
-        elif target == w.wumpus:
-            risk += WUMPUS_STAY
-        elif target in w.bats:
-            risk += BAT_CHAIN_DEATH
-    return risk / len(worlds)
-
-
-Action = Move | Shot
-StateKey = tuple[int, frozenset[World]]
-
-
-def best_risky_move(worlds: set[World], player: int, visited: set[int], tried: set[Action]) -> int:
-    nbrs = [room for room in GRAPH[player] if Move(room) not in tried]
-    if not nbrs:
-        nbrs = list(GRAPH[player])
-    scored = sorted(nbrs, key=lambda r: (death_prob_on_move(worlds, r), r in visited, r))
-    return scored[0]
-
-
-def best_speculative_shot(worlds: set[World], player: int, tried: set[Action]) -> Shot | None:
-    """If a shot is *expected* better than the best move, return it.
-
-    A shot is judged by P(kill) and P(post-miss death). Only consider when
-    the wumpus candidate set is small enough that we have a real chance.
-    """
-    candidates = {w.wumpus for w in worlds}
-    if not (1 < len(candidates) <= 6):
-        return None
-    # Best shot = the one maximizing the share of worlds in which path hits wumpus.
-    best_shot: Shot | None = None
-    best_kill = 0.0
-    best_loss = 1.0
-    for shot in enumerate_shots(player):
-        if shot in tried:
-            continue
-        hit = sum(1 for w in worlds if w.wumpus in shot.path)
-        if hit == 0:
-            continue
-        kill_p = hit / len(worlds)
-        # On miss the wumpus may walk into us with ~0.25 per world where
-        # player is adjacent to wumpus.
-        miss_worlds = [w for w in worlds if w.wumpus not in shot.path]
-        miss_death = (
-            sum(0.25 for w in miss_worlds if player in GRAPH[w.wumpus])
-            / max(1, len(worlds))
-        )
-        # Expected loss = (1 - kill_p) * 0 (we keep playing) but the miss may kill us
-        # AND we burn an arrow. Approximate: expected_loss = miss_death.
-        if kill_p > best_kill or (kill_p == best_kill and miss_death < best_loss):
-            best_kill = kill_p
-            best_loss = miss_death
-            best_shot = shot
-    if best_shot is None:
-        return None
-    move_risk = min(death_prob_on_move(worlds, n) for n in GRAPH[player])
-    # Shoot only when expected-immediate-death of shot < move's, AND kill is
-    # plausible. Avoid burning arrows on tiny kill_p.
-    if best_kill >= 0.34 and best_loss <= move_risk + 0.02:
-        return best_shot
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Decide: layered policy.
-# ---------------------------------------------------------------------------
-def decide(worlds: set[World], player: int, visited: set[int], tried: set[Action]) -> Move | Shot:
-    # 1. Guaranteed-winning shot beats anything.
-    winners = guaranteed_winning_shots(worlds)
-    if winners:
-        # prefer shortest path
-        winners.sort(key=lambda s: len(s.path))
-        return winners[0]
-    # 2. Speculative shot if expected value favors it.
-    spec = best_speculative_shot(worlds, player, tried)
-    if spec is not None:
-        return spec
-    # 3. Guaranteed-safe move (Codex's choose_move logic — info-gain ranked).
-    safe = guaranteed_safe_moves(worlds)
-    if safe:
-        return _best_safe_move(worlds, safe, visited, tried)
-    # 4. Forced gamble.
-    return Move(best_risky_move(worlds, player, visited, tried))
-
-
-def _best_safe_move(worlds: set[World], safe: list[int], visited: set[int], tried: set[Action]) -> Move:
-    """Among guaranteed-safe neighbors, pick the most informative.
-
-    Mirrors Codex's choice in `choose_move`: minimize worst-case partition
-    size, break ties by maximizing distinct observation classes.
-    """
-    import collections
-
-    best_room: int | None = None
-    best_key = None
-    candidates = [room for room in safe if Move(room) not in tried]
-    if not candidates:
-        candidates = safe
-    for room in candidates:
-        partitions = collections.Counter(
-            observation_for(w.with_player(room)) for w in worlds
-        )
-        worst = max(partitions.values())
-        distinct = len(partitions)
-        key = (room in visited, worst, -distinct, room)
-        if best_key is None or key < best_key:
-            best_key = key
-            best_room = room
-    assert best_room is not None
-    return Move(best_room)
-
-
-# ---------------------------------------------------------------------------
-# Stats + Hunter loop.
-# ---------------------------------------------------------------------------
-@dataclass
-class Stats:
+@dataclass(slots=True)
+class SessionStats:
     games: int = 0
     wins: int = 0
     losses_pit: int = 0
     losses_wumpus: int = 0
     losses_arrow: int = 0
-    losses_arrows_out: int = 0
+    losses_out_of_arrows: int = 0
+    losses_unknown: int = 0
     total_moves: int = 0
     total_shots: int = 0
-    # Per-game move log (for verbose summary).
-    last_game_log: list[str] = field(default_factory=list)
+    last_trail: list[str] = field(default_factory=list)
+
+    def record(self, log: GameLog) -> None:
+        self.games += 1
+        self.total_moves += log.moves
+        self.total_shots += log.shots
+        self.last_trail = log.trail
+        if log.outcome == "win":
+            self.wins += 1
+        elif log.outcome == "loss-pit":
+            self.losses_pit += 1
+        elif log.outcome == "loss-wumpus":
+            self.losses_wumpus += 1
+        elif log.outcome == "loss-arrow":
+            self.losses_arrow += 1
+        elif log.outcome == "loss-out-of-arrows":
+            self.losses_out_of_arrows += 1
+        else:
+            self.losses_unknown += 1
 
 
+# ---------------------------------------------------------------------------
+# Hunter: drives one life of the binary using strategy + belief updates.
+# ---------------------------------------------------------------------------
 class Hunter:
     def __init__(
         self,
-        *,
         argv: list[str],
-        verbose: bool = False,
+        *,
+        strict: bool = False,
         quiet: bool = False,
-        log_io: bool = False,
     ) -> None:
-        self.argv = argv
-        self.verbose = verbose
-        self.quiet = quiet
-        self.log_io = log_io
-        self.proc = GameProcess(argv)
-        self.stats = Stats()
-        self.worlds: set[World] = set()
-        self.player: int = 0
+        self.argv: list[str] = argv
+        self.strict: bool = strict
+        self.quiet: bool = quiet
+        # I/O echoes by default; --quiet hides them.
+        self.log_io: bool = not quiet
+        self.proc: GameProcess = GameProcess(argv)
+        self.stats: SessionStats = SessionStats()
+        self.belief: Belief = frozenset()
         self.visited: set[int] = set()
         self.tried_by_state: dict[StateKey, set[Action]] = {}
+        self.trail: list[str] = []
+        self.game_moves: int = 0
+        self.game_shots: int = 0
 
-    # ----- I/O -----
+    # ---- I/O helpers ----
     def _read(self) -> Block:
         text = self.proc.read_until_prompt()
         if self.log_io:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+            _ = sys.stdout.write(text)
+            _ = sys.stdout.flush()
         return parse_block(text)
 
-    def _send(self, s: str) -> None:
+    def _send(self, value: str) -> None:
         if self.log_io:
-            sys.stdout.write(f"{s}\n")
-            sys.stdout.flush()
-        self.proc.write_line(s)
+            _ = sys.stdout.write(f"{value}\n")
+            _ = sys.stdout.flush()
+        self.proc.write_line(value)
 
-    # ----- session loop -----
-    def play(self, *, target_wins: int = 1, max_games: int = 1000) -> None:
+    # ---- session entry point ----
+    def play_session(self, *, target_wins: int, max_games: int) -> None:
         self.proc.start()
+        try:
+            blk = self._drain_to_opening()
+            while self.stats.wins < target_wins and self.stats.games < max_games:
+                next_blk = self._step(blk)
+                if next_blk is None:
+                    break
+                blk = next_blk
+        finally:
+            self.proc.stop()
+
+    def _drain_to_opening(self) -> Block:
+        """Read through any pre-game prompts and start the next game."""
         blk = self._read()
         if blk.prompt == "INSTRUCTIONS (Y-N)":
             self._send("N")
             blk = self._read()
-        # First in-game block: an Observation block + SHOOT OR MOVE prompt.
+        while blk.prompt == "TYPE AN E THEN RETURN":
+            self._send("E")
+            blk = self._read()
         self._begin_game(blk)
+        return blk
 
-        while self.stats.wins < target_wins and self.stats.games < max_games:
-            blk = self._step(blk)
-            if blk is None:
-                break
+    def _hard_restart(self) -> Block:
+        """Tear the binary down and bring up a fresh process."""
         self.proc.stop()
-        self._print_summary()
+        self.proc.start()
+        return self._drain_to_opening()
 
+    # ---- game lifecycle ----
     def _begin_game(self, blk: Block) -> None:
         if blk.obs is None:
-            raise RuntimeError(f"could not parse opening observation:\n{blk.raw!r}")
-        self.player = blk.obs.room
-        self.visited = {self.player}
+            raise RuntimeError(
+                f"could not parse opening observation; got:\n{blk.raw!r}"
+            )
+        self.belief = initial_belief(blk.obs)
+        self.visited = {blk.obs.room}
         self.tried_by_state = {}
-        self.worlds = initial_worlds(blk.obs)
-        self.stats.last_game_log = [f"start in {self.player}"]
+        self.trail = [f"start in {blk.obs.room}"]
+        self.game_moves = 0
+        self.game_shots = 0
 
     def _step(self, blk: Block) -> Block | None:
         if blk.terminal:
@@ -497,115 +350,139 @@ class Hunter:
         if prompt == "TYPE AN E THEN RETURN":
             self._send("E")
             return self._read()
-        if self.verbose:
-            print(f"[unknown prompt: {prompt!r}]\n{blk.raw!r}", file=sys.stderr)
+        # Unknown prompt; try to nudge with a blank line.
+        if not self.quiet:
+            _ = sys.stderr.write(f"[unknown prompt: {prompt!r}]\n")
         self._send("")
         return self._read()
 
-    def _on_choose(self) -> Block:
-        state_key = (self.player, frozenset(self.worlds))
+    def _on_choose(self) -> Block | None:
+        if not self.belief:
+            # Belief collapsed — our model and the binary diverged. Record
+            # a loss, hard-restart the binary, and continue with a fresh game.
+            self._record_early_loss("loss-unknown", note="empty belief")
+            return self._hard_restart()
+        state_key = (current_player(self.belief), self.game_shots, self.belief)
         tried = self.tried_by_state.setdefault(state_key, set())
-        action = decide(self.worlds, self.player, self.visited, tried)
+        visited = frozenset(self.visited)
+        tried_frozen = frozenset(tried)
+        action = choose_action(
+            self.belief,
+            strict=self.strict,
+            visited=visited,
+            tried=tried_frozen,
+        )
+        if action is None and not self.strict:
+            action = best_desperation_action(
+                self.belief,
+                visited=visited,
+                tried=tried_frozen,
+            )
+        if action is None:
+            reason = (
+                "strict: no guaranteed-safe or guaranteed-winning action"
+                if self.strict
+                else "no untried action for exact belief state"
+            )
+            # End the session cleanly so stats reflect that the model/strategy
+            # reached a public state it cannot advance from without repeating.
+            if not self.quiet:
+                _ = sys.stderr.write(f"[{reason}]\n")
+            self._record_early_loss("loss-unknown", note=reason)
+            return None
         tried.add(action)
-        inputs = action_to_inputs(action)
         if isinstance(action, Shot):
-            self.stats.total_shots += 1
-            self.stats.last_game_log.append(f"shoot {action.path}")
-            return self._dispatch_shot(action, inputs)
-        else:
-            self.stats.total_moves += 1
-            self.stats.last_game_log.append(f"move {action.room}")
-            return self._dispatch_move(action, inputs)
+            self.game_shots += 1
+            self.trail.append(f"shoot {fmt_shot_path(action.path)}")
+            return self._dispatch_shot(action)
+        # Move
+        self.game_moves += 1
+        self.trail.append(f"move {action.room}")
+        return self._dispatch_move(action.room)
 
-    def _dispatch_move(self, move: Move, inputs: list[str]) -> Block:
-        # inputs == ["M", str(room)]
-        self._send(inputs[0])
+    # ---- action dispatch ----
+    def _dispatch_move(self, target_room: int) -> Block:
+        self._send("M")
         blk = self._read()
         if blk.terminal:
             return blk
         if blk.prompt == "WHERE TO":
-            self._send(inputs[1])
+            self._send(str(target_room))
             blk = self._read()
         if blk.terminal:
-            # Death on move (pit, or wumpus walked into us, or arrow self —
-            # though arrow_self can't happen on move). Belief no longer
-            # needed; lifecycle handler will reset.
             return blk
-        # Belief update.
+        if blk.obs is None:
+            return blk
         if blk.bat_snatch:
-            if blk.obs is None:
-                # Shouldn't happen — snatch always shows new room.
-                return blk
-            self.worlds = update_on_snatch(self.worlds, move.room, blk.obs)
-            self.player = blk.obs.room
-            self.visited.add(self.player)
+            self.belief = update_on_snatch(self.belief, target_room, blk.obs)
         else:
-            if blk.obs is None:
-                return blk
-            self.worlds = update_on_move(self.worlds, move.room, blk.obs)
-            self.player = blk.obs.room
-            self.visited.add(self.player)
+            self.belief = update_on_move(self.belief, target_room, blk.obs)
+        self.visited.add(blk.obs.room)
         return blk
 
-    def _dispatch_shot(self, shot: Shot, inputs: list[str]) -> Block:
-        # inputs == ["S", str(len), *path]
-        self._send(inputs[0])  # "S"
+    def _dispatch_shot(self, shot: Shot) -> Block:
+        self._send("S")
         blk = self._read()
         if blk.terminal:
             return blk
         if blk.prompt == "NO. OF ROOMS (1-5)":
-            self._send(inputs[1])
+            self._send(str(len(shot.path)))
             blk = self._read()
             if blk.terminal:
                 return blk
-        for room_str in inputs[2:]:
-            if blk.prompt == "ROOM #":
-                self._send(room_str)
-                blk = self._read()
-                if blk.terminal:
-                    return blk
-            else:
+        for room in shot.path:
+            if blk.prompt != "ROOM #":
                 break
-        # Post-shot result.
-        if blk.victory:
+            self._send(str(room))
+            blk = self._read()
+            if blk.terminal:
+                return blk
+        if blk.terminal:
             return blk
-        if blk.death_arrow or blk.death_wumpus or blk.out_of_arrows or blk.death_pit:
+        if blk.obs is None:
             return blk
-        if blk.miss and blk.obs is not None:
-            self.worlds = update_on_miss(self.worlds, shot.path, blk.obs)
-            self.player = blk.obs.room
-            self.visited.add(self.player)
-        elif blk.obs is not None:
-            self.player = blk.obs.room
-            self.visited.add(self.player)
-            self.worlds = filter_worlds(self.worlds, blk.obs)
+        if blk.miss:
+            self.belief = update_on_miss(self.belief, shot.path, blk.obs)
+        else:
+            # Either we'll see victory next (handled above) or the binary
+            # printed a fresh obs after the shot resolved with no kill +
+            # no migration. Refilter to be safe.
+            self.belief = filter_belief(self.belief, blk.obs)
+        self.visited.add(blk.obs.room)
         return blk
 
-    def _handle_terminal(self, blk: Block) -> Block | None:
-        self.stats.games += 1
+    # ---- terminal handling ----
+    def _outcome_from(self, blk: Block) -> Outcome:
         if blk.victory:
-            self.stats.wins += 1
-            tag = "WIN"
-        elif blk.death_pit:
-            self.stats.losses_pit += 1
-            tag = "LOSS pit"
-        elif blk.death_wumpus:
-            self.stats.losses_wumpus += 1
-            tag = "LOSS wumpus"
-        elif blk.death_arrow:
-            self.stats.losses_arrow += 1
-            tag = "LOSS arrow-self"
-        elif blk.out_of_arrows:
-            self.stats.losses_arrows_out += 1
-            tag = "LOSS out-of-arrows"
-        else:
-            tag = "LOSS unknown"
-        if not self.quiet:
-            log_tail = ", ".join(self.stats.last_game_log[-6:])
-            print(f"[game {self.stats.games:4d}] {tag:20s}  trail: …{log_tail}")
+            return "win"
+        if blk.death_pit:
+            return "loss-pit"
+        if blk.death_wumpus:
+            return "loss-wumpus"
+        if blk.death_arrow:
+            return "loss-arrow"
+        if blk.out_of_arrows:
+            return "loss-out-of-arrows"
+        if blk.lose_banner and self.game_shots >= 5:
+            return "loss-out-of-arrows"
+        return "loss-unknown"
 
-        # Advance to SAME SETUP prompt, answer N, get a fresh observation.
-        deadline = time.monotonic() + 3.0
+    def _handle_terminal(self, blk: Block) -> Block | None:
+        outcome = self._outcome_from(blk)
+        self.stats.record(
+            GameLog(
+                outcome=outcome,
+                moves=self.game_moves,
+                shots=self.game_shots,
+                trail=self.trail,
+            )
+        )
+        if not self.quiet:
+            tail = ", ".join(self.trail[-6:])
+            print(f"[game {self.stats.games:4d}] {outcome:18s}  trail: …{tail}")
+
+        # Advance to SAME SETUP prompt.
+        deadline = time.monotonic() + SETUP_PROMPT_DEADLINE_S
         while blk.prompt != "SAME SETUP (Y-N)":
             if time.monotonic() > deadline or not blk.raw:
                 break
@@ -615,61 +492,121 @@ class Hunter:
             blk = self._read()
             self._begin_game(blk)
             return blk
-        # Process wedged; restart fresh.
-        self.proc.stop()
-        self.proc.start()
-        blk = self._read()
-        if blk.prompt == "INSTRUCTIONS (Y-N)":
-            self._send("N")
-            blk = self._read()
-        self._begin_game(blk)
-        return blk
+        # Process wedged; restart binary fresh.
+        return self._hard_restart()
 
-    def _print_summary(self) -> None:
-        s = self.stats
-        print()
-        print(f"games   : {s.games}")
-        print(f"wins    : {s.wins}")
-        print(
-            "losses  : "
-            f"pit={s.losses_pit} wumpus={s.losses_wumpus} "
-            f"arrow-self={s.losses_arrow} out-of-arrows={s.losses_arrows_out}"
+    def _record_early_loss(self, outcome: Outcome, *, note: str) -> None:
+        """Record a game that ended before reaching a terminal block."""
+        self.stats.record(
+            GameLog(
+                outcome=outcome,
+                moves=self.game_moves,
+                shots=self.game_shots,
+                trail=self.trail + [f"[{note}]"],
+            )
         )
-        if s.games:
-            print(f"win rate: {s.wins / s.games * 100:.1f}%")
-        print(f"moves   : {s.total_moves}")
-        print(f"shots   : {s.total_shots}")
+        if not self.quiet:
+            tail = ", ".join(self.trail[-6:])
+            print(
+                f"[game {self.stats.games:4d}] {outcome:18s}  trail: …{tail} ({note})"
+            )
 
 
 # ---------------------------------------------------------------------------
+# CLI entry.
+# ---------------------------------------------------------------------------
+@dataclass(slots=True)
+class CliArgs:
+    binary: str
+    seed: int | None
+    games: int
+    target_wins: int
+    quiet: bool
+    strict: bool
+
+
+def _parse_cli(argv: list[str] | None) -> CliArgs:
+    p = argparse.ArgumentParser(
+        description="Wumpus Hunter — fair fresh-game autoplayer for /tmp/wumpus.",
+    )
+    _ = p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Pass -s SEED to the binary (deterministic opening)",
+    )
+    _ = p.add_argument(
+        "--games",
+        type=int,
+        default=100,
+        help="Max games to play (default: 100)",
+    )
+    _ = p.add_argument(
+        "--target-wins",
+        type=int,
+        default=1,
+        help="Stop after this many wins (default: 1)",
+    )
+    _ = p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress game I/O; print only the final summary",
+    )
+    _ = p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse to act without certainty (no risk-min, no speculative shots)",
+    )
+    # Advanced / debug.
+    _ = p.add_argument("--binary", default=DEFAULT_BINARY, help=argparse.SUPPRESS)
+    ns = p.parse_args(argv)
+    return CliArgs(
+        binary=cast(str, ns.binary),
+        seed=cast(int | None, ns.seed),
+        games=cast(int, ns.games),
+        target_wins=cast(int, ns.target_wins),
+        quiet=cast(bool, ns.quiet),
+        strict=cast(bool, ns.strict),
+    )
+
+
 def build_argv(binary: str, seed: int | None) -> list[str]:
-    argv = [binary]
+    argv: list[str] = [binary]
     if seed is not None:
         argv += ["-s", str(seed)]
     return argv
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--target-wins", type=int, default=1)
-    p.add_argument("--max-games", type=int, default=1000)
-    p.add_argument("--seed", type=int, default=None,
-                   help="Pass -s SEED to the binary (note: same-setup=N still reseeds across games)")
-    p.add_argument("--binary", default="/tmp/wumpus")
-    p.add_argument("-v", "--verbose", action="store_true")
-    p.add_argument("-q", "--quiet", action="store_true")
-    p.add_argument("--log-io", action="store_true", help="Print raw game I/O")
-    args = p.parse_args(argv)
-
-    h = Hunter(
-        argv=build_argv(args.binary, args.seed),
-        verbose=args.verbose,
-        quiet=args.quiet,
-        log_io=args.log_io,
+def print_summary(stats: SessionStats) -> None:
+    print()
+    print(f"games   : {stats.games}")
+    print(f"wins    : {stats.wins}")
+    loss_line = (
+        f"losses  : pit={stats.losses_pit} "
+        + f"wumpus={stats.losses_wumpus} "
+        + f"arrow={stats.losses_arrow} "
+        + f"out-of-arrows={stats.losses_out_of_arrows} "
+        + f"unknown={stats.losses_unknown}"
     )
-    h.play(target_wins=args.target_wins, max_games=args.max_games)
-    return 0 if h.stats.wins >= args.target_wins else 1
+    print(loss_line)
+    if stats.games:
+        print(f"win rate: {stats.wins / stats.games * 100:.1f}%")
+    print(f"moves   : {stats.total_moves}")
+    print(f"shots   : {stats.total_shots}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_cli(argv)
+    hunter = Hunter(
+        argv=build_argv(args.binary, args.seed),
+        strict=args.strict,
+        quiet=args.quiet,
+    )
+    hunter.play_session(target_wins=args.target_wins, max_games=args.games)
+    print_summary(hunter.stats)
+    return 0 if hunter.stats.wins >= args.target_wins else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
