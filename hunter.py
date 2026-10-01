@@ -15,29 +15,31 @@ starts over with a freshly randomized layout.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import pty
 import re
 import select
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Final, Literal, cast, get_args
+from typing import Final, Literal, get_args
 
 from belief import (
     ARROW_SELF_TEXT,
-    Action,
     BAT_SNATCH_TEXT,
-    Belief,
+    LOSE_BANNER_TEXT,
     MISSED_TEXT,
     OUT_OF_ARROWS_TEXT,
-    LOSE_BANNER_TEXT,
-    Observation,
     PIT_DEATH_TEXT,
     PIT_SHRIEK_TEXT,
-    Shot,
     WIN_TEXT,
     WUMPUS_DEATH_TEXT,
+    Action,
+    Belief,
+    Observation,
+    Shot,
     current_player,
     filter_belief,
     fmt_shot_path,
@@ -52,10 +54,11 @@ from strategy import (
     update_on_snatch,
 )
 
-
 DEFAULT_BINARY: Final[str] = "/tmp/wumpus"
 DEFAULT_TIMEOUT_S: Final[float] = 5.0
 QUIET_WINDOW_S: Final[float] = 0.08
+SILENCE_AFTER_OUTPUT_S: Final[float] = 0.5
+STARTING_ARROWS: Final[int] = 5
 SETUP_PROMPT_DEADLINE_S: Final[float] = 3.0
 StateKey = tuple[int, int, Belief]
 
@@ -69,6 +72,7 @@ PromptKind = Literal[
     "TYPE AN E THEN RETURN",
 ]
 PROMPT_KINDS: Final[tuple[PromptKind, ...]] = get_args(PromptKind)
+_PROMPT_BY_TEXT: Final[dict[str, PromptKind]] = {kind: kind for kind in PROMPT_KINDS}
 _PROMPT_RE: Final[re.Pattern[str]] = re.compile(
     "|".join(re.escape(p) for p in PROMPT_KINDS)
 )
@@ -80,38 +84,32 @@ _PROMPT_RE: Final[re.Pattern[str]] = re.compile(
 class GameProcess:
     def __init__(self, argv: list[str]) -> None:
         self.argv: list[str] = argv
-        self.pid: int | None = None
+        self.process: subprocess.Popen[bytes] | None = None
         self.fd: int | None = None
 
     def start(self) -> None:
-        pid, fd = pty.fork()
-        if pid == 0:
-            # Any failure in the child must terminate it; otherwise the child
-            # falls through to parent code and races on the pty.
-            try:
-                os.execv(self.argv[0], self.argv)
-            except BaseException:
-                os._exit(127)
-        self.pid = pid
+        fd, terminal = pty.openpty()
+        try:
+            self.process = subprocess.Popen(
+                self.argv,
+                stdin=terminal,
+                stdout=terminal,
+                stderr=terminal,
+                start_new_session=True,
+            )
+        finally:
+            os.close(terminal)
         self.fd = fd
 
     def stop(self) -> None:
-        if self.pid is None:
+        if self.process is None:
             return
-        try:
-            os.kill(self.pid, 9)
-        except ProcessLookupError:
-            pass
-        try:
-            _ = os.waitpid(self.pid, 0)
-        except ChildProcessError:
-            pass
+        self.process.kill()
+        _ = self.process.wait()
         if self.fd is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.close(self.fd)
-            except OSError:
-                pass
-        self.pid = None
+        self.process = None
         self.fd = None
 
     def read_until_prompt(
@@ -143,7 +141,7 @@ class GameProcess:
             trimmed = out.rstrip(b" \t\r\n")
             if trimmed.endswith(b"?"):
                 break
-            if out and now - last_byte_t > 0.5:
+            if out and now - last_byte_t > SILENCE_AFTER_OUTPUT_S:
                 break
         return out.decode("utf-8", errors="replace")
 
@@ -185,8 +183,7 @@ class Block:
 def _last_prompt(upper_text: str) -> PromptKind | None:
     last: PromptKind | None = None
     for match in _PROMPT_RE.finditer(upper_text):
-        # cast: every alternation in _PROMPT_RE is a PromptKind literal.
-        last = cast(PromptKind, match.group(0))
+        last = _PROMPT_BY_TEXT[match.group(0)]
     return last
 
 
@@ -239,18 +236,19 @@ class SessionStats:
         self.total_moves += log.moves
         self.total_shots += log.shots
         self.last_trail = log.trail
-        if log.outcome == "win":
-            self.wins += 1
-        elif log.outcome == "loss-pit":
-            self.losses_pit += 1
-        elif log.outcome == "loss-wumpus":
-            self.losses_wumpus += 1
-        elif log.outcome == "loss-arrow":
-            self.losses_arrow += 1
-        elif log.outcome == "loss-out-of-arrows":
-            self.losses_out_of_arrows += 1
-        else:
-            self.losses_unknown += 1
+        match log.outcome:
+            case "win":
+                self.wins += 1
+            case "loss-pit":
+                self.losses_pit += 1
+            case "loss-wumpus":
+                self.losses_wumpus += 1
+            case "loss-arrow":
+                self.losses_arrow += 1
+            case "loss-out-of-arrows":
+                self.losses_out_of_arrows += 1
+            case "loss-unknown":
+                self.losses_unknown += 1
 
 
 # ---------------------------------------------------------------------------
@@ -341,18 +339,21 @@ class Hunter:
     def _step(self, blk: Block) -> Block | None:
         if blk.terminal:
             return self._handle_terminal(blk)
-        prompt = blk.prompt
-        if prompt == "SHOOT OR MOVE (S-M)":
-            return self._on_choose()
-        if prompt == "SAME SETUP (Y-N)":
-            return self._handle_terminal(blk)
-        if prompt == "INSTRUCTIONS (Y-N)":
-            self._send("N")
-            return self._read()
-        if prompt == "TYPE AN E THEN RETURN":
-            self._send("E")
-            return self._read()
-        # Unknown prompt; try to nudge with a blank line.
+        match blk.prompt:
+            case "SHOOT OR MOVE (S-M)":
+                return self._on_choose()
+            case "SAME SETUP (Y-N)":
+                return self._handle_terminal(blk)
+            case "INSTRUCTIONS (Y-N)":
+                self._send("N")
+                return self._read()
+            case "TYPE AN E THEN RETURN":
+                self._send("E")
+                return self._read()
+            case "WHERE TO" | "NO. OF ROOMS (1-5)" | "ROOM #" | None:
+                return self._nudge_unexpected_prompt(blk.prompt)
+
+    def _nudge_unexpected_prompt(self, prompt: PromptKind | None) -> Block:
         if not self.quiet:
             _ = sys.stderr.write(f"[unknown prompt: {prompt!r}]\n")
         self._send("")
@@ -455,18 +456,17 @@ class Hunter:
 
     # ---- terminal handling ----
     def _outcome_from(self, blk: Block) -> Outcome:
-        if blk.victory:
-            return "win"
-        if blk.death_pit:
-            return "loss-pit"
-        if blk.death_wumpus:
-            return "loss-wumpus"
-        if blk.death_arrow:
-            return "loss-arrow"
-        if blk.out_of_arrows:
-            return "loss-out-of-arrows"
-        if blk.lose_banner and self.game_shots >= 5:
-            return "loss-out-of-arrows"
+        spent_every_arrow = blk.lose_banner and self.game_shots >= STARTING_ARROWS
+        outcome_by_flag: tuple[tuple[bool, Outcome], ...] = (
+            (blk.victory, "win"),
+            (blk.death_pit, "loss-pit"),
+            (blk.death_wumpus, "loss-wumpus"),
+            (blk.death_arrow, "loss-arrow"),
+            (blk.out_of_arrows or spent_every_arrow, "loss-out-of-arrows"),
+        )
+        for flagged, outcome in outcome_by_flag:
+            if flagged:
+                return outcome
         return "loss-unknown"
 
     def _handle_terminal(self, blk: Block) -> Block | None:
@@ -504,7 +504,7 @@ class Hunter:
                 outcome=outcome,
                 moves=self.game_moves,
                 shots=self.game_shots,
-                trail=self.trail + [f"[{note}]"],
+                trail=[*self.trail, f"[{note}]"],
             )
         )
         if not self.quiet:
@@ -517,8 +517,7 @@ class Hunter:
 # ---------------------------------------------------------------------------
 # CLI entry.
 # ---------------------------------------------------------------------------
-@dataclass(slots=True)
-class CliArgs:
+class CliArgs(argparse.Namespace):
     binary: str
     seed: int | None
     games: int
@@ -562,15 +561,7 @@ def _parse_cli(argv: list[str] | None) -> CliArgs:
     )
     # Advanced / debug.
     _ = p.add_argument("--binary", default=DEFAULT_BINARY, help=argparse.SUPPRESS)
-    ns = p.parse_args(argv)
-    return CliArgs(
-        binary=cast(str, ns.binary),
-        seed=cast(int | None, ns.seed),
-        games=cast(int, ns.games),
-        target_wins=cast(int | None, ns.target_wins),
-        quiet=cast(bool, ns.quiet),
-        strict=cast(bool, ns.strict),
-    )
+    return p.parse_args(argv, namespace=CliArgs())
 
 
 def build_argv(binary: str, seed: int | None) -> list[str]:
@@ -586,10 +577,10 @@ def print_summary(stats: SessionStats) -> None:
     print(f"wins    : {stats.wins}")
     loss_line = (
         f"losses  : pit={stats.losses_pit} "
-        + f"wumpus={stats.losses_wumpus} "
-        + f"arrow={stats.losses_arrow} "
-        + f"out-of-arrows={stats.losses_out_of_arrows} "
-        + f"unknown={stats.losses_unknown}"
+        f"wumpus={stats.losses_wumpus} "
+        f"arrow={stats.losses_arrow} "
+        f"out-of-arrows={stats.losses_out_of_arrows} "
+        f"unknown={stats.losses_unknown}"
     )
     print(loss_line)
     if stats.games:

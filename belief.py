@@ -14,9 +14,11 @@ a `frozenset[World]`.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # ---------------------------------------------------------------------------
 # Cave: fixed dodecahedron from the 1972 Yob BASIC source. Verified
@@ -75,11 +77,9 @@ BATS_LINE: Final[str] = "BATS NEARBY!"
 # twice. Wumpus is singular, so smell is a flag.
 # ---------------------------------------------------------------------------
 _OBS_RE: Final[re.Pattern[str]] = re.compile(
-    (
-        r"(?P<warnings>(?:(?:I SMELL A WUMPUS!|I FEEL A DRAFT|BATS NEARBY!)\r?\n)*)"
-        + r"YOU ARE IN ROOM (?P<room>\d+)\r?\n"
-        + r"TUNNELS LEAD TO (?P<a>\d+) (?P<b>\d+) (?P<c>\d+)"
-    )
+    r"(?P<warnings>(?:(?:I SMELL A WUMPUS!|I FEEL A DRAFT|BATS NEARBY!)\r?\n)*)"
+    r"YOU ARE IN ROOM (?P<room>\d+)\r?\n"
+    r"TUNNELS LEAD TO (?P<a>\d+) (?P<b>\d+) (?P<c>\d+)"
 )
 
 
@@ -200,7 +200,7 @@ def initial_belief(obs: Observation) -> Belief:
         for i, pit_a in enumerate(pit_pool):
             for pit_b in pit_pool[i + 1 :]:
                 pits = (pit_a, pit_b)  # already sorted
-                bat_pool = [r for r in pit_pool if r != pit_a and r != pit_b]
+                bat_pool = [r for r in pit_pool if r not in pits]
                 for j, bat_a in enumerate(bat_pool):
                     for bat_b in bat_pool[j + 1 :]:
                         bats = (bat_a, bat_b)

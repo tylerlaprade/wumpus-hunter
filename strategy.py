@@ -23,9 +23,8 @@ Belief updates the strict solver doesn't cover are exported here as
 from __future__ import annotations
 
 import collections
-from collections.abc import Iterable
-from functools import lru_cache
-from typing import Final
+from functools import cache
+from typing import TYPE_CHECKING, Final
 
 from belief import (
     GRAPH,
@@ -40,6 +39,9 @@ from belief import (
     observation_for,
     possible_wumpus_rooms,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # ---------------------------------------------------------------------------
 # Risk constants.
@@ -57,7 +59,7 @@ _EMPTY_TRIED: Final[frozenset[Action]] = frozenset()
 # ---------------------------------------------------------------------------
 # Shot enumeration.
 # ---------------------------------------------------------------------------
-@lru_cache(maxsize=None)
+@cache
 def enumerate_shots(player: int, max_len: int = MAX_ARROW_LEN) -> list[Shot]:
     """All arrow paths the binary will accept from `player`.
 
@@ -76,16 +78,15 @@ def enumerate_shots(player: int, max_len: int = MAX_ARROW_LEN) -> list[Shot]:
             shots.append(Shot(path))
         if len(path) == max_len:
             return
-        current = path[-1] if path else player
-        # "Two back" relative to the next step is path[-2] if it exists,
-        # otherwise the implicit player room.
-        two_back = path[-2] if len(path) >= 2 else player
+        trail = (player, *path)
+        current = trail[-1]
+        two_back = trail[-2] if path else player
         for nxt in GRAPH[current]:
             if nxt == two_back:
                 continue  # U-turn: position i+2 == position i
             if nxt == player:
                 continue  # arrow re-entering player's room kills us
-            walk(path + (nxt,))
+            walk((*path, nxt))
 
     walk(())
     shots.sort(key=lambda s: (len(s.path), s.path))
@@ -99,14 +100,14 @@ def guaranteed_safe_moves(belief: Belief) -> list[int]:
     if not belief:
         return []
     player = current_player(belief)
-    safe: list[int] = []
-    for room in GRAPH[player]:
+    return [
+        room
+        for room in GRAPH[player]
         if all(
             room != w.wumpus and room not in w.pits and room not in w.bats
             for w in belief
-        ):
-            safe.append(room)
-    return safe
+        )
+    ]
 
 
 def guaranteed_winning_shots(belief: Belief) -> list[Shot]:
@@ -426,7 +427,7 @@ def update_on_miss(belief: Belief, shot_path: tuple[int, ...], post: Observation
 
     For each world: if the wumpus was on the shot path, the shot would
     have hit (inconsistent with miss → filter). Otherwise branch over
-    `{wumpus} ∪ GRAPH[wumpus]`, dropping the branch that would have
+    `{wumpus} | set(GRAPH[wumpus])`, dropping the branch that would have
     eaten us (filtered by no-death observation).
     """
     out: set[World] = set()
