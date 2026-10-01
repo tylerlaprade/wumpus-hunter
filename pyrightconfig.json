@@ -1,5 +1,5 @@
 {
+  "extends": "../../.config/basedpyright/pyrightconfig.json",
   "exclude": ["**/__pycache__", ".venv", "venv"],
-  "pythonVersion": "3.14",
-  "typeCheckingMode": "all"
+  "pythonVersion": "3.14"
 }
