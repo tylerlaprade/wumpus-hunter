@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """hunter.py - I/O, game lifecycle, CLI.
 
-Spawns the `/tmp/wumpus` binary on a pseudo-tty, runs one fair life
+Spawns the `wumpus` binary found on PATH on a pseudo-tty, runs one fair life
 end-to-end using `strategy.choose_action`, applying the dynamic belief
 updates from `strategy` for snatches and missed shots. Optionally repeats
 across many independent games for benchmarking.
@@ -20,6 +20,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -54,7 +55,7 @@ from strategy import (
     update_on_snatch,
 )
 
-DEFAULT_BINARY: Final[str] = "/tmp/wumpus"
+BINARY_NAME: Final[str] = "wumpus"
 DEFAULT_TIMEOUT_S: Final[float] = 5.0
 QUIET_WINDOW_S: Final[float] = 0.08
 SILENCE_AFTER_OUTPUT_S: Final[float] = 0.5
@@ -518,7 +519,7 @@ class Hunter:
 # CLI entry.
 # ---------------------------------------------------------------------------
 class CliArgs(argparse.Namespace):
-    binary: str
+    binary: str | None
     seed: int | None
     games: int
     target_wins: int | None
@@ -528,7 +529,7 @@ class CliArgs(argparse.Namespace):
 
 def _parse_cli(argv: list[str] | None) -> CliArgs:
     p = argparse.ArgumentParser(
-        description="Wumpus Hunter — fair fresh-game autoplayer for /tmp/wumpus.",
+        description="Wumpus Hunter — fair fresh-game autoplayer for the wumpus binary on PATH.",
     )
     _ = p.add_argument(
         "--seed",
@@ -560,7 +561,7 @@ def _parse_cli(argv: list[str] | None) -> CliArgs:
         help="Refuse to act without certainty (no risk-min, no speculative shots)",
     )
     # Advanced / debug.
-    _ = p.add_argument("--binary", default=DEFAULT_BINARY, help=argparse.SUPPRESS)
+    _ = p.add_argument("--binary", default=None, help=argparse.SUPPRESS)
     return p.parse_args(argv, namespace=CliArgs())
 
 
@@ -591,8 +592,15 @@ def print_summary(stats: SessionStats) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_cli(argv)
+    binary = args.binary or shutil.which(BINARY_NAME)
+    if binary is None:
+        print(
+            f"{BINARY_NAME} is not on PATH; install ESR's version with `brew install wumpus` or pass --binary",
+            file=sys.stderr,
+        )
+        return 1
     hunter = Hunter(
-        argv=build_argv(args.binary, args.seed),
+        argv=build_argv(binary, args.seed),
         strict=args.strict,
         quiet=args.quiet,
     )
